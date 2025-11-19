@@ -73,6 +73,10 @@ with st.sidebar:
         
         # 提交按钮
         submit_button = st.form_submit_button(label="🚀 应用参数 & 运行回测")
+        
+    st.markdown("### 🧠 AI 实验室")
+    if st.button("✨ AI 自动寻找最佳参数"):
+        st.session_state['do_optimize'] = True
 
 # ==========================================
 # 3. 核心逻辑函数 (增加缓存与增强逻辑)
@@ -89,13 +93,19 @@ def get_agent(api_key):
             base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
             api_key=api_key,
         ),
+        # 确保开启 Markdown 和工具调用
         tools=[DuckDuckGoTools(), YFinanceTools(stock_price=True, company_news=True, stock_fundamentals=True)],
         instructions=[
-            "你是一个华尔街级别的基金经理。",
-            "在分析时，必须结合技术面（趋势）和基本面（估值）。",
-            "如果用户询问回测结果，请解释夏普比率和最大回撤的含义。",
-            "回答必须结构清晰，重点突出，使用中文。",
-            "如果涉及数据比较，请使用 Markdown 表格。"
+            "你是一位拥有 20 年经验的华尔街对冲基金经理，擅长宏观分析与量化交易。",
+            "【思维链要求】在回答用户问题之前，请遵循以下思考步骤：",
+            "1. **观察 (Observe)**: 检查用户提供的或工具获取的数据（价格趋势、估值指标、新闻）。",
+            "2. **分析 (Analyze)**: 结合基本面（低估/高估）和技术面（金叉/死叉/超买超卖）进行交叉验证。",
+            "3. **结论 (Conclude)**: 给出明确的观点（看多/看空/观望），并提示核心风险点。",
+            "【格式要求】",
+            "- 使用 Markdown 表格对比数据。",
+            "- 关键结论请加粗。",
+            "- 如果缺乏数据，请明确告知'数据不足'，不要编造。",
+            "- 语气专业、客观、冷静。"
         ],
         markdown=True,
         show_tool_calls=True 
@@ -103,15 +113,16 @@ def get_agent(api_key):
 
 @st.cache_data(ttl=3600)
 def get_stock_data(symbol, period="5y"):
-    """
-    获取历史数据并缓存，避免重复请求
-    ttl=3600 表示缓存 1 小时有效
-    """
     try:
-        df = yf.Ticker(symbol).history(period=period)
-        if df.empty: return None
+        # 增加 auto_adjust=True 有时能解决数据对齐问题
+        df = yf.Ticker(symbol).history(period=period, auto_adjust=True)
+        if df.empty: 
+            print(f"【调试信息】获取到的数据为空: {symbol}") # 会打印在运行 Streamlit 的黑色终端里
+            return None
         return df
-    except Exception:
+    except Exception as e:
+        print(f"【调试信息】报错详情: {e}") # 关键：看这里打印了什么！
+        st.error(f"内部报错: {e}") # 将报错直接显示在网页上供你查看
         return None
 
 @st.cache_data(ttl=3600)
@@ -125,6 +136,50 @@ def get_fundamental_info(symbol):
         return info, financials, cashflow
     except Exception:
         return {}, pd.DataFrame(), pd.DataFrame()
+    
+def generate_context_summary(symbol, info, metrics, params):
+    """
+    将复杂的 DataFrame 和字典数据转换为自然语言摘要，
+    供 Agent 在回答问题时参考。
+    """
+    # 1. 基本面摘要
+    fund_str = "暂无基本面数据"
+    if info and isinstance(info, dict):
+        fund_str = f"""
+        - 市值: {info.get('marketCap', 'N/A')}
+        - 市盈率 (PE): {info.get('trailingPE', 'N/A')}
+        - ROE: {info.get('returnOnEquity', 'N/A')}
+        - 行业: {info.get('sector', '未知')}
+        """
+
+    # 2. 策略回测摘要
+    # 修复点：先检查 metrics 是否为字典 (dict)，防止报错
+    if isinstance(metrics, dict):
+        bt_str = f"""
+        - 策略参数: 短均线={params[0]}, 长均线={params[1]}
+        - 总收益率: {metrics.get('Total Return', 0):.2%}
+        - 年化收益 (CAGR): {metrics.get('CAGR', 0):.2%}
+        - 最大回撤: {metrics.get('Max Drawdown', 0):.2%}
+        - 夏普比率: {metrics.get('Sharpe Ratio', 0):.2f}
+        - 交易次数: {metrics.get('Trade Count', 0)}
+        """
+    else:
+        # 如果 metrics 是字符串（错误信息）或 None
+        bt_str = f"回测数据不可用 (原因: {metrics if metrics else '数据不足'})"
+    
+    context = f"""
+    【当前全维度数据快照 - 标的: {symbol}】
+    
+    [1. 财务基本面]
+    {fund_str}
+    
+    [2. 技术面双均线策略表现]
+    {bt_str}
+    
+    [指令]
+    请基于以上数据回答用户问题。如果数据不可用，请告知用户可能需要检查股票代码或市场数据。
+    """
+    return context
 
 def run_backtest_optimized(df_origin, short_w, long_w, capital, cost_rate):
     """
@@ -148,7 +203,7 @@ def run_backtest_optimized(df_origin, short_w, long_w, capital, cost_rate):
         
         # 实际持仓：昨天的信号决定今天
         df['Position'] = df['Signal_Raw'].shift(1)
-        df['Position'].fillna(0, inplace=True)
+        df['Position'] = df['Position'].fillna(0)
         
         # 3. 计算基础收益
         df['Daily_Return'] = df['Close'].pct_change()
@@ -196,6 +251,43 @@ def run_backtest_optimized(df_origin, short_w, long_w, capital, cost_rate):
         return df, metrics
     except Exception as e:
         return None, str(e)
+    
+def optimize_strategy(df, capital, cost_rate):
+    """
+    简单的网格搜索，寻找夏普比率最高的均线组合
+    """
+    best_sharpe = -100
+    best_params = (0, 0)
+    best_metrics = {}
+    
+    # 搜索空间：短期 5-50，长期 20-200 (步长加大以节省计算时间)
+    # 注意：Streamlit 中计算太久会超时，这里做简化处理
+    short_range = range(5, 60, 10) 
+    long_range = range(20, 150, 20)
+    
+    progress_bar = st.progress(0)
+    total_steps = len(short_range) * len(long_range)
+    step = 0
+    
+    for s in short_range:
+        for l in long_range:
+            step += 1
+            progress_bar.progress(step / total_steps)
+            
+            if s >= l: continue # 短期必须小于长期
+            
+            # 复用之前的回测逻辑，但我们需要提取其中的计算核心，
+            # 为了代码简洁，这里直接调用 run_backtest_optimized 
+            # (生产环境建议拆分计算逻辑以提速)
+            _, metrics = run_backtest_optimized(df, s, l, capital, cost_rate)
+            
+            if metrics and metrics['Sharpe Ratio'] > best_sharpe:
+                best_sharpe = metrics['Sharpe Ratio']
+                best_params = (s, l)
+                best_metrics = metrics
+                
+    progress_bar.empty()
+    return best_params, best_metrics
 
 # ==========================================
 # 4. 主界面布局 (Tabs)
@@ -209,8 +301,7 @@ with tab1:
     
     with col_chart:
         st.subheader(f"📈 {symbol} 实时走势")
-        
-        
+              
         # 2. 获取数据
         with st.spinner("正在加载全量数据..."):
             df_price = get_stock_data(symbol, period="max")
@@ -299,8 +390,42 @@ with tab1:
             st.error("无法加载数据")
 
     with col_chat:
-        st.subheader("🤖 AI 顾问")
-        chat_container = st.container(height=650)
+        st.subheader("🤖 AI 投研顾问")
+        
+        # --- A. 处理自动寻优逻辑 ---
+        if st.session_state.get('do_optimize', False):
+            with st.spinner("AI 正在疯狂回测历史数据，寻找最优解..."):
+                # ... (获取数据和寻优代码保持不变) ...
+                df_opt = get_stock_data(symbol, period="5y")
+                if df_opt is not None:
+                    best_p, best_m = optimize_strategy(df_opt, initial_capital, trans_cost)
+                    
+                    # --- 修改开始：使用 st.toast 跨 Tab 通知 ---
+                    msg = f"✅ 寻优完成！最佳参数: {best_p[0]} / {best_p[1]} (夏普: {best_m['Sharpe Ratio']:.2f})"
+                    st.toast(msg, icon="🎉") 
+                    # --- 修改结束 ---
+                    
+                    st.success(f"寻优完成！最佳均线: 短期 {best_p[0]} / 长期 {best_p[1]}")
+                    st.info(f"该组合夏普比率: {best_m['Sharpe Ratio']:.2f}, 总回报: {best_m['Total Return']:.2%}")
+                    st.caption("请在左侧侧边栏手动更新上述参数以查看详细图表。")
+            st.session_state['do_optimize'] = False
+
+        # --- B. 准备 AI 的上下文数据 (Real-time Context) ---
+        # 1. 获取当前的基本面
+        curr_info, _, _ = get_fundamental_info(symbol)
+        # 2. 获取当前的回测结果 (即使在 Tab 3 没点开，这里也要算一下给 AI 看)
+        df_context = get_stock_data(symbol, period="5y")
+
+        # 增加一层保护：如果连 df_context 都没有，直接给空字典
+        if df_context is not None and not df_context.empty:
+            _, curr_metrics = run_backtest_optimized(df_context, short_window, long_window, initial_capital, trans_cost)
+        else:
+            curr_metrics = "无法获取历史股价数据，请检查股票代码"
+        # 3. 生成系统级 Context 字符串
+        system_context = generate_context_summary(symbol, curr_info, curr_metrics, (short_window, long_window))
+
+        # --- C. 聊天界面 ---
+        chat_container = st.container(height=600)
         
         if "messages" not in st.session_state:
             st.session_state.messages = []
@@ -309,7 +434,7 @@ with tab1:
             for msg in st.session_state.messages:
                 st.chat_message(msg["role"]).write(msg["content"])
 
-        if prompt := st.chat_input("关于该股票的问题..."):
+        if prompt := st.chat_input(f"问我关于 {symbol} 的任何问题..."):
             if not api_key:
                 st.error("请先设置 API Key")
             else:
@@ -321,10 +446,14 @@ with tab1:
                     if agent:
                         response_placeholder = st.empty()
                         full_response = ""
-                        # 增强 Context：加入当前标的信息
-                        context_prompt = f"【当前分析标的: {symbol}】\n用户问题: {prompt}"
+                        
+                        # --- 核心修改：将 Context 拼接到用户 Prompt 前面 ---
+                        # 这样 AI 就能基于当前的图表和回测数据回答，而不是瞎编
+                        augmented_prompt = f"{system_context}\n\n用户问题: {prompt}"
+                        
                         try:
-                            resp_stream = agent.run(context_prompt, stream=True)
+                            # 注意：我们发给 Agent 的是 augmented_prompt，但界面上用户只看到自己的 prompt
+                            resp_stream = agent.run(augmented_prompt, stream=True)
                             for chunk in resp_stream:
                                 content = ""
                                 if hasattr(chunk, "content"): content = chunk.content
@@ -409,10 +538,47 @@ with tab2:
                 
                 fig_cf.update_layout(barmode='group', height=350, template="plotly_dark", margin=dict(t=10, b=10))
                 st.plotly_chart(fig_cf, use_container_width=True)
+        # ... (接在 现金流结构 图表代码之后) ...
 
+        st.markdown("---")
+        st.subheader("3. 📰 AI 舆情情感分析")
+        
+        col_news_btn, col_news_display = st.columns([1, 3])
+        
+        with col_news_btn:
+            st.caption("AI 将检索最新新闻并计算市场情绪得分 (-1 为极度悲观，+1 为极度乐观)")
+            analyze_news = st.button("🔍 扫描新闻 & 分析情绪")
+            
+        if analyze_news:
+            with col_news_display:
+                if not api_key:
+                    st.error("请先设置 API Key")
+                else:
+                    agent = get_agent(api_key)
+                    with st.spinner(f"正在阅读 {symbol} 的全网新闻..."):
+                        try:
+                            # 1. 构造专门的 Prompt 让 Agent 读书
+                            news_prompt = f"""
+                            请使用工具搜索关于 {symbol} (股票代码) 最近 7 天的 5 条重要财经新闻。
+                            
+                            任务要求：
+                            1. 简要列出这 5 条新闻的标题。
+                            2. 综合分析这些新闻对股价的影响。
+                            3. 给出一个“市场情绪得分”（范围 -1.0 到 +1.0，0 为中性）。
+                            4. 输出格式：
+                               - **新闻摘要**: ...
+                               - **情绪得分**: `+0.x` 或 `-0.x`
+                               - **关键理由**: ...
+                            """
+                            response = agent.run(news_prompt)
+                            st.markdown(response.content)
+                            
+                        except Exception as e:
+                            st.error(f"分析失败: {str(e)}")
+        
         # AI 研报部分保持原逻辑，但利用缓存数据
         st.markdown("---")
-        st.subheader("3. 🤖 AI 深度点评")
+        st.subheader("4. 🤖 AI 深度点评")
         if st.button("生成深度研报", type="primary"):
             if not api_key:
                 st.error("请设置 API Key")
@@ -457,6 +623,42 @@ with tab3:
             k4.metric("夏普比率 (Sharpe)", f"{res['Sharpe Ratio']:.2f}", help=">1 为佳，>2 非常优秀")
             
             st.markdown(f"**期末资产:** ${res['Final Capital']:,.2f} | **交易次数:** {int(res['Trade Count'])} | **单边费率:** {trans_cost*100}%")
+         
+            st.markdown("---")
+            
+            # 新增：AI 策略诊断
+            with st.expander("🩺 AI 策略诊断报告 (点击展开)", expanded=True):
+                if not api_key:
+                    st.warning("请输入 API Key 以获取 AI 对该回测结果的专业评价")
+                else:
+                    # 自动触发评价（或者做成按钮）
+                    if st.button("🧠 生成回测诊断"):
+                        with st.spinner("AI 正在分析你的策略漏洞..."):
+                            diag_agent = get_agent(api_key)
+                            
+                            # 这里的 prompt 专门针对量化陷阱
+                            diag_prompt = f"""
+                            【策略诊断任务】
+                            用户在 {symbol} 上测试了双均线策略 (Short={short_window}, Long={long_window})。
+                            
+                            回测结果:
+                            - 总回报: {res['Total Return']:.2%}
+                            - 夏普比率: {res['Sharpe Ratio']:.2f}
+                            - 最大回撤: {res['Max Drawdown']:.2%}
+                            - 交易次数: {res['Trade Count']}
+                            
+                            请像一位严格的风控官一样指出问题：
+                            1. **过拟合风险**: 交易次数是否太少？（少于 10 次通常统计意义不大）
+                            2. **收益风险比**: 夏普比率是否大于 1？如果小于 1，这个策略是否值得执行？
+                            3. **回撤承受力**: 最大回撤是否会导致爆仓？
+                            4. **改进建议**: 如何调整均线参数可能更好？
+                            """
+                            
+                            try:
+                                resp = diag_agent.run(diag_prompt)
+                                st.markdown(resp.content)
+                            except Exception as e:
+                                st.error(str(e))
             
             st.markdown("---")
 
